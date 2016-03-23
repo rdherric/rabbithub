@@ -377,10 +377,23 @@ do_validate(Callback, Topic, LeaseSeconds, ActualUse, VerifyToken) ->
                    "" -> "?";
                    _  -> "&"
                end,
+			   
+		   %% Get any Authorization tokens out of the URL
+		   AuthToken = case string:rchr(_NetLoc, $@) of
+			  0 -> "";
+			  _ -> string:substr(_NetLoc, 1, string:rchr(_NetLoc, $@) - 1)
+		   end,
+		   
+		   %% Pull the Authorization token out of the URL
+           URL = re:replace(Callback, AuthToken ++ "@", "", [{return, list}]) ++ C ++ mochiweb_util:urlencode(Params),
 
-           URL = Callback ++ C ++ mochiweb_util:urlencode(Params),
-
-           case httpc:request(get, {URL, []}, [], []) of
+		   %% Setup an Authorization header - assumes Basic
+		   Headers = case AuthToken of
+		      "" -> [];
+			  _ -> [{"Authorization", "Basic " ++ base64:encode_to_string(AuthToken)}]
+		   end,
+		   
+           case httpc:request(get, {URL, Headers}, [], []) of
                {ok, {{_Version, StatusCode, _StatusText}, _Headers, Body}} 
                   when StatusCode >= 200 andalso StatusCode < 300 ->
                      BinaryBody = list_to_binary(Body),

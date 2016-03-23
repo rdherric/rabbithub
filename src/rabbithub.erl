@@ -11,6 +11,16 @@
 -export([respond_xml/5]).
 -export([deliver_via_post/3, error_and_unsub/2]).
 
+-export([init/1]).
+
+%% Start subscriptions via a bootstep only once routing is ready. Schema might
+%% already be set up, which is fine.
+-rabbit_boot_step({?MODULE,
+                   [{description, "RabbitHub"},
+                    {mfa, {rabbithub, setup_schema, []}},
+                    {mfa, {rabbit_sup, start_child, [rabbithub_sup]}},
+                    {mfa, {rabbithub_subscription, start_subscriptions, []}},
+                    {requires, routing_ready}]}).
 
 -include_lib("xmerl/include/xmerl.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
@@ -19,7 +29,13 @@
 
 
 start(_Type, _StartArgs) ->
-%% TBD - should check return status of a few things here!
+    hub_init(),
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+
+
+init([]) -> {ok, {{one_for_one, 1, 5}, []}}.
+
+hub_init() ->
     setup_schema(),
     ssl:start(),
 
@@ -27,14 +43,7 @@ start(_Type, _StartArgs) ->
     HttpOpts =  get_env(http_client_options, []), 
     ok = httpc:set_options(HttpOpts),
     {ok, Opts} = httpc:get_options(all),
-
-    {ok, Pid} = rabbithub_sup:start_link(),
-    rabbithub_web:start(),
-    rabbithub_subscription:start_subscriptions(),
-
-    rabbit_log:info("RabbitHub started~n"),
-    rabbit_log:info("RabbitHub HTTP client options:~n~p~n", [Opts]),
-    {ok, Pid}.
+    rabbithub_web:start().
 
 
 stop(_State) ->
@@ -196,32 +205,64 @@ deliver_via_post(#rabbithub_subscription{callback = Callback},
                    _  -> "&"
                end,
 
-           URL = Callback ++ C ++ mochiweb_util:urlencode([{'hub.topic', RoutingKeyBin}]),
+		   % Get the hub.topic part of the URL if the environment variable
+		   % indicates that it should be added as the PubSubHubBub specification
+		   % does not require it - default is to add the topic
+		   Topic = case application:get_env(rabbithub, append_hub_topic_to_callback) of
+				{ok, false} ->
+					"";
+				_ ->
+					C ++ mochiweb_util:urlencode([{'hub.topic', RoutingKeyBin}])
+		   end,
 
-           case httpc:request(post, {URL, 
-                                     [{"Content-length", integer_to_list(size(PayloadBin))},
-                                      {"Content-type", case ContentTypeBin of
-                                                          undefined -> "application/octet-stream";
-                                                          _ -> binary_to_list(ContentTypeBin)
-                                            end},
-                                      {"X-AMQP-Routing-Key", binary_to_list(RoutingKeyBin)} | ExtraHeaders], 
-                                     [], PayloadBin}, [], []) of
+           URL = Callback ++ Topic,
+
+		   ContentType = case ContentTypeBin of
+							undefined -> "application/octet-stream";
+							_ -> binary_to_list(ContentTypeBin)
+						 end,
+
+		   Payload = {URL, 
+					 [{"Content-length", integer_to_list(size(PayloadBin))},
+					  {"X-AMQP-Routing-Key", binary_to_list(RoutingKeyBin)} | ExtraHeaders], 
+                      ContentType, PayloadBin},
+						 
+		   % Log the request if the environment variable has been set - default
+		   % is not to log the request
+		   case application:get_env(rabbithub, log_http_post_request) of
+				{ok, true} ->
+					rabbit_log:info("RabbitHub post request~n~p~n", [Payload]);
+				_ ->
+					ok
+		   end,
+		   
+           case httpc:request(post, Payload, [], []) of
                {ok, {{_Version, StatusCode, _StatusText}, _Headers, _Body}} ->
                   if
                      StatusCode >= 200 andalso StatusCode < 300 ->
                          {ok, StatusCode};
                      true ->
-                         {error, StatusCode}
+                         {error, StatusCode, {{_Version, StatusCode, _StatusText}, _Headers, _Body}}
                   end;
                {error, Reason} ->
-                   {error, Reason}
+                   {error, Reason, {}}
             end;
         _ ->
-            {error, invalid_callback_url}
+            {error, invalid_callback_url, {}}
     end.
 
 
 error_and_unsub(Subscription, ErrorReport) ->
-    rabbit_log:error("RabbitHub unsubscribing~n~p~n", [ErrorReport]),
-    rabbithub_subscription:delete(Subscription),
+    rabbit_log:error("RabbitHub post error~n~p~n", [ErrorReport]),
+	
+	% Check the environment variable unsubscribe_on_http_post_error to 
+	% determine if the subscription should be deleted or not - default 
+	% is to unsubscribe on any post error
+	case application:get_env(rabbithub, unsubscribe_on_http_post_error) of
+		{ok, false} ->
+			ok;
+		_ ->
+		   rabbithub_subscription:delete(Subscription)
+	end,
+
     ok.
