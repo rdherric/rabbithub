@@ -195,38 +195,36 @@ deliver_via_post(#rabbithub_subscription{callback = Callback},
                                 content = Content0 = #content{payload_fragments_rev = PayloadRev}},
                  ExtraHeaders) ->
     case catch mochiweb_util:urlsplit(Callback) of
-        {_Scheme, _NetLoc, _Path, ExistingQuery, _Fragment} ->         
+        {_Scheme, _NetLoc, _Path, _ExistingQuery, _Fragment} ->         
            #content{properties = #'P_basic'{content_type = ContentTypeBin}} =
                rabbit_binary_parser:ensure_content_decoded(Content0),
            PayloadBin = list_to_binary(lists:reverse(PayloadRev)),
 
-           C = case ExistingQuery of
-                   "" -> "?";
-                   _  -> "&"
-               end,
-
 		   % Get the hub.topic part of the URL if the environment variable
 		   % indicates that it should be added as the PubSubHubBub specification
 		   % does not require it - default is to add the topic
-		   Topic = case application:get_env(rabbithub, append_hub_topic_to_callback) of
+		   Params = case application:get_env(rabbithub, append_hub_topic_to_callback) of
 				{ok, false} ->
-					"";
+					[];
 				_ ->
-					C ++ mochiweb_util:urlencode([{'hub.topic', RoutingKeyBin}])
+					[{"hub.topic", mochiweb_util:urlencode(RoutingKeyBin)}]
 		   end,
-
-           URL = Callback ++ Topic,
 
 		   ContentType = case ContentTypeBin of
 							undefined -> "application/octet-stream";
 							_ -> binary_to_list(ContentTypeBin)
-						 end,
+		   end,
 
+		   %% Get the Basic Auth Request
+		   {URL, Headers} = rabbithub_web:create_httpc_basic_auth_request(Callback, Params),
+		   
 		   Payload = {URL, 
-					 [{"Content-length", integer_to_list(size(PayloadBin))},
-					  {"X-AMQP-Routing-Key", binary_to_list(RoutingKeyBin)} | ExtraHeaders], 
+					  [{"Content-length", integer_to_list(size(PayloadBin))},
+					   {"X-AMQP-Routing-Key", binary_to_list(RoutingKeyBin)}] ++
+					  Headers ++
+					  ExtraHeaders,
                       ContentType, PayloadBin},
-						 
+					  
 		   % Log the request if the environment variable has been set - default
 		   % is not to log the request
 		   case application:get_env(rabbithub, log_http_post_request) of

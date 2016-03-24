@@ -1,6 +1,6 @@
 -module(rabbithub_web).
 
--export([start/0, handle_req/1, listener/0]).
+-export([start/0, handle_req/1, listener/0, create_httpc_basic_auth_request/2]).
 
 -include("rabbithub.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
@@ -361,7 +361,7 @@ can_shortcut(_, _) ->
 
 do_validate(Callback, Topic, LeaseSeconds, ActualUse, VerifyToken) ->
     case catch mochiweb_util:urlsplit(Callback) of
-        {_Scheme, _NetLoc, _Path, ExistingQuery, _Fragment} ->   	%% Scheme can be http or https
+        {_Scheme, _NetLoc, _Path, _ExistingQuery, _Fragment} ->   	%% Scheme can be http or https
            Challenge = list_to_binary(rabbithub:b64enc(rabbit_guid:binary(rabbit_guid:gen(), "c"))),
            Params0 = [{'hub.mode', ActualUse},
                       {'hub.topic', Topic},
@@ -373,27 +373,10 @@ do_validate(Callback, Topic, LeaseSeconds, ActualUse, VerifyToken) ->
                          _ -> [{'hub.verify_token', VerifyToken} | Params0]
                     end,
 
-           C = case ExistingQuery of
-                   "" -> "?";
-                   _  -> "&"
-               end,
-			   
-		   %% Get any Authorization tokens out of the URL
-		   AuthToken = case string:rchr(_NetLoc, $@) of
-			  0 -> "";
-			  _ -> string:substr(_NetLoc, 1, string:rchr(_NetLoc, $@) - 1)
-		   end,
+		   %% Get a Basic Auth Request
+		   Request = create_httpc_basic_auth_request(Callback, Params),
 		   
-		   %% Pull the Authorization token out of the URL
-           URL = re:replace(Callback, AuthToken ++ "@", "", [{return, list}]) ++ C ++ mochiweb_util:urlencode(Params),
-
-		   %% Setup an Authorization header - assumes Basic
-		   Headers = case AuthToken of
-		      "" -> [];
-			  _ -> [{"Authorization", "Basic " ++ base64:encode_to_string(AuthToken)}]
-		   end,
-		   
-           case httpc:request(get, {URL, Headers}, [], []) of
+           case httpc:request(get, Request, [], []) of
                {ok, {{_Version, StatusCode, _StatusText}, _Headers, Body}} 
                   when StatusCode >= 200 andalso StatusCode < 300 ->
                      BinaryBody = list_to_binary(Body),
@@ -748,3 +731,43 @@ perform_request(Method, Facet, HubMode, _ResourceType, Resource, ParsedQuery, Re
 
 handle_hub_post(Req) ->
     Req:respond({200, [], "You posted!"}).
+
+create_httpc_basic_auth_request(Callback, Params) ->
+	%% Split the URL into parts
+	{_Scheme, NetLoc, _Path, ExistingQuery, _Fragment} = mochiweb_util:urlsplit(Callback),
+	   
+	%% Get any Authorization tokens out of the URL
+	AuthToken = case string:rchr(NetLoc, $@) of
+		0 -> "";
+		_ -> string:substr(NetLoc, 1, string:rchr(NetLoc, $@) - 1)
+	end,
+
+	%% Figure out if this URL had an existing QueryString
+	C = case ExistingQuery of
+		"" -> case erlang:length(Params) of
+			0 -> "";
+			_ -> "?"
+		end;
+		_  -> case erlang:length(Params) of 
+			0 -> "";
+			_ -> "&"
+		end
+	end,
+
+	%% Setup a string for replacing only the Auth token
+	AuthTokenReplace = case AuthToken of
+		"" -> "";
+		_ -> AuthToken ++ "@"
+	end,
+	
+	%% Pull the Authorization token out of the URL
+	URL = re:replace(Callback, AuthTokenReplace, "", [{return, list}]) ++ C ++ mochiweb_util:urlencode(Params),
+
+	%% Setup an Authorization header - assumes Basic
+	Headers = case AuthToken of
+	  "" -> [];
+	  _ -> [{"Authorization", "Basic " ++ base64:encode_to_string(AuthToken)}]
+	end,
+
+	%% Now return the Request 
+	{URL, Headers}.
